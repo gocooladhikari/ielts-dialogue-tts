@@ -40,6 +40,23 @@ st.markdown("""
             font-weight: 600;
             font-size: 0.85rem;
         }
+        .narrator-badge {
+            background-color: #FEF3C7;
+            color: #92400E;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        .pause-badge {
+            background-color: #F1F5F9;
+            color: #475569;
+            border: 1px dashed #94A3B8;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
         .line-box {
             background: #F8FAFC;
             border-left: 3px solid #3B82F6;
@@ -47,6 +64,15 @@ st.markdown("""
             margin-bottom: 8px;
             border-radius: 0 6px 6px 0;
             font-size: 0.94rem;
+        }
+        .pause-box {
+            background: #F8FAFC;
+            border-left: 3px dashed #94A3B8;
+            padding: 8px 14px;
+            margin-bottom: 8px;
+            border-radius: 0 6px 6px 0;
+            font-size: 0.90rem;
+            color: #64748B;
         }
         .monologue-badge {
             background-color: #FEF3C7;
@@ -61,12 +87,11 @@ st.markdown("""
 
 
 # Curated Top-Tier Microsoft Neural Voices for Conversational IELTS
-# These are hand-selected for natural inflection, expressive human breath, and authenticity
 CURATED_IELTS_VOICES = {
     # British English (Primary IELTS Accent)
     "en-GB-RyanNeural": {"name": "Ryan (British Male - Friendly & Expressive)", "gender": "Male", "locale": "en-GB"},
     "en-GB-SoniaNeural": {"name": "Sonia (British Female - Crisp & Professional)", "gender": "Female", "locale": "en-GB"},
-    "en-GB-ThomasNeural": {"name": "Thomas (British Male - Calm & Articulate)", "gender": "Male", "locale": "en-GB"},
+    "en-GB-ThomasNeural": {"name": "Thomas (British Male - Calm, Academic & Articulate)", "gender": "Male", "locale": "en-GB"},
     "en-GB-MaisieNeural": {"name": "Maisie (British Female - Warm & Casual)", "gender": "Female", "locale": "en-GB"},
     "en-GB-LibbyNeural": {"name": "Libby (British Female - Polite & Gentle)", "gender": "Female", "locale": "en-GB"},
 
@@ -88,15 +113,17 @@ CURATED_IELTS_VOICES = {
 
 # Heuristics for auto voice matching
 FEMALE_INDICATORS = {
-    "amber", "sarah", "emma", "jenny", "sonia", "clara", "natasha", "lucy", "mary",
+    "ruth", "amber", "sarah", "emma", "jenny", "sonia", "clara", "natasha", "lucy", "mary",
     "alice", "lisa", "anna", "emily", "jessica", "chloe", "sophie", "elena", "rachel",
-    "woman", "girl", "female", "lady", "mother", "mrs", "miss", "ms", "sister", "daughter"
+    "woman", "girl", "female", "lady", "mother", "mrs", "miss", "ms", "sister", "daughter",
+    "student_f"
 }
 
 MALE_INDICATORS = {
-    "agent", "examiner", "john", "alex", "ryan", "liam", "william", "thomas", "guy",
-    "peter", "david", "michael", "george", "james", "robert", "brian", "eric", "steffan",
-    "man", "boy", "male", "gentleman", "father", "mr", "brother", "son", "officer", "interviewer"
+    "ed", "tutor", "dr", "doctor", "collins", "agent", "examiner", "john", "alex", "ryan",
+    "liam", "william", "thomas", "guy", "peter", "david", "michael", "george", "james",
+    "robert", "brian", "eric", "steffan", "man", "boy", "male", "gentleman", "father",
+    "mr", "brother", "son", "officer", "interviewer", "professor"
 }
 
 
@@ -121,7 +148,6 @@ def get_all_english_voices() -> List[Dict[str, str]]:
     try:
         return asyncio.run(_fetch())
     except Exception:
-        # Fallback to curated dictionary if network blip
         return [
             {"ShortName": k, "FriendlyName": v["name"], "Locale": v["locale"], "Gender": v["gender"]}
             for k, v in CURATED_IELTS_VOICES.items()
@@ -157,16 +183,26 @@ def clean_raw_input(raw_text: str) -> str:
     return raw_text
 
 
-def parse_dialogue_or_monologue(raw_text: str) -> Tuple[List[Dict[str, str]], bool]:
+def parse_dialogue_or_monologue(raw_text: str) -> Tuple[List[Dict[str, any]], bool]:
     """
-    Parses transcript and identifies whether it's a multi-speaker dialogue or single speaker monologue.
-    Returns: (list_of_lines, is_monologue)
+    Parses transcript and identifies:
+    - Multi-speaker dialogues ([Speaker]: Text)
+    - Exam pauses ([Pause: 30 seconds], [Pause: 15s], etc.)
+    - Single speaker monologues
+
+    Returns: (list_of_items, is_monologue)
+    Each item is:
+      {"type": "dialogue", "speaker": "Tutor", "text": "..."}
+      OR
+      {"type": "pause", "duration_ms": 30000, "label": "[Pause: 30 seconds]"}
     """
     cleaned = clean_raw_input(raw_text)
     lines = cleaned.splitlines()
 
     speaker_pattern = re.compile(r"^\s*(?:\[([^\]]+)\]|([A-Za-z0-9_\-\s]{1,30}))\s*:\s*(.+)$")
-    parsed_lines: List[Dict[str, str]] = []
+    pause_pattern = re.compile(r"^\s*\[Pause\s*:\s*(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|milliseconds?|ms)?\]\s*$", re.IGNORECASE)
+
+    parsed_items: List[Dict[str, any]] = []
     has_tagged_speakers = False
 
     for line in lines:
@@ -174,34 +210,69 @@ def parse_dialogue_or_monologue(raw_text: str) -> Tuple[List[Dict[str, str]], bo
         if not line_clean:
             continue
 
+        # 1. Check for [Pause: X seconds]
+        pause_match = pause_pattern.match(line_clean)
+        if pause_match:
+            val = float(pause_match.group(1))
+            unit = (pause_match.group(2) or "seconds").lower()
+            if unit.startswith("m"):
+                ms = int(val)
+            else:
+                ms = int(val * 1000)
+            parsed_items.append({
+                "type": "pause",
+                "duration_ms": ms,
+                "label": line_clean
+            })
+            continue
+
+        # 2. Check for [Speaker]: Dialogue
         match = speaker_pattern.match(line_clean)
         if match:
             speaker_tag = (match.group(1) or match.group(2)).strip()
             content = match.group(3).strip()
             if len(speaker_tag.split()) <= 4 and not any(c in speaker_tag for c in ".!?,;()"):
                 has_tagged_speakers = True
-                parsed_lines.append({"speaker": speaker_tag, "text": content})
+                parsed_items.append({
+                    "type": "dialogue",
+                    "speaker": speaker_tag,
+                    "text": content
+                })
                 continue
 
-        if parsed_lines:
-            parsed_lines[-1]["text"] += f" {line_clean}"
+        # 3. Continuation of previous line or narration
+        if parsed_items and parsed_items[-1]["type"] == "dialogue":
+            parsed_items[-1]["text"] += f" {line_clean}"
         else:
-            parsed_lines.append({"speaker": "Speaker", "text": line_clean})
+            parsed_items.append({
+                "type": "dialogue",
+                "speaker": "Speaker",
+                "text": line_clean
+            })
 
     if not has_tagged_speakers:
-        full_monologue_text = " ".join([item["text"] for item in parsed_lines]).strip()
-        return [{"speaker": "Speaker", "text": full_monologue_text}], True
+        # Full monologue
+        dialogue_texts = [item["text"] for item in parsed_items if item["type"] == "dialogue"]
+        full_monologue_text = " ".join(dialogue_texts).strip()
+        # Keep any pauses if present
+        filtered_items = []
+        for item in parsed_items:
+            if item["type"] == "pause":
+                filtered_items.append(item)
+            elif not any(x.get("speaker") == "Speaker" for x in filtered_items):
+                filtered_items.append({"type": "dialogue", "speaker": "Speaker", "text": full_monologue_text})
+        return filtered_items, True
 
-    unique_speakers = {item["speaker"].lower() for item in parsed_lines}
-    is_monologue = (len(unique_speakers) == 1)
+    dialogue_speakers = {item["speaker"].lower() for item in parsed_items if item["type"] == "dialogue"}
+    is_monologue = (len(dialogue_speakers) == 1)
 
-    return parsed_lines, is_monologue
+    return parsed_items, is_monologue
 
 
 def normalize_ielts_speech_text(text: str) -> str:
     """
     Normalizes transcript text specifically for natural edge-tts conversational delivery:
-    1. Expands hyphenated spelling (e.g. J-A-M-I-E-S-O-N -> J... A... M... I... E... S... O... N.)
+    1. Expands hyphenated spelling (e.g. J-A-M-I-E-S-O-N -> J. A. M. I. E. S. O. N.)
     2. Replaces em-dashes and long hyphens with natural breath pauses
     3. Normalizes time references (9:30 AM -> 9:30 AM)
     4. Handles conversational openers naturally (Oh, hello -> Oh, hello.)
@@ -245,15 +316,28 @@ def smart_match_edge_voice(speaker_name: str, used_voices: List[str], all_availa
 
     male_pool = [
         "en-GB-RyanNeural",
-        "en-AU-WilliamMultilingualNeural",
         "en-GB-ThomasNeural",
+        "en-AU-WilliamMultilingualNeural",
         "en-US-BrianMultilingualNeural",
         "en-US-GuyNeural",
         "en-CA-LiamNeural",
         "en-NZ-MitchellNeural",
     ]
 
-    if "amber" in words:
+    # Specific IELTS roles matching
+    if "narrator" in words:
+        # Official British exam narrator (Thomas or Sonia)
+        candidate_pool = ["en-GB-ThomasNeural", "en-GB-RyanNeural", "en-GB-SoniaNeural"]
+    elif "tutor" in words or "doctor" in words or "collins" in words:
+        # Academic Tutor (Ryan or Thomas)
+        candidate_pool = ["en-GB-RyanNeural", "en-GB-ThomasNeural", "en-US-BrianMultilingualNeural"]
+    elif "ruth" in words:
+        # Student Ruth (Sonia, Natasha, or Maisie)
+        candidate_pool = ["en-GB-SoniaNeural", "en-AU-NatashaNeural", "en-GB-MaisieNeural"]
+    elif "ed" in words:
+        # Student Ed (William or Liam or Guy)
+        candidate_pool = ["en-AU-WilliamMultilingualNeural", "en-CA-LiamNeural", "en-US-GuyNeural", "en-GB-RyanNeural"]
+    elif "amber" in words:
         candidate_pool = female_pool
     elif "agent" in words or "examiner" in words:
         candidate_pool = male_pool
@@ -294,7 +378,7 @@ async def generate_single_turn_audio(
 
 
 def synthesize_natural_dialogue(
-    parsed_dialogue: List[Dict[str, str]],
+    parsed_dialogue: List[Dict[str, any]],
     speaker_voice_map: Dict[str, str],
     base_rate_pct: int = -2,
     base_pitch_hz: int = 0,
@@ -308,29 +392,48 @@ def synthesize_natural_dialogue(
     Synthesizes natural, human-like dialogue using Microsoft Neural Voices:
     - Pre-normalizes conversational text (spelled letters, times, dashes)
     - Adds subtle conversational rhythm variations (organic human pace jitter)
+    - Automatically executes explicit exam pause gaps ([Pause: 30 seconds])
     - Inserts human turn-taking pauses with organic duration windows
     - Smoothly stitches audio using pydub
     """
     combined_audio = AudioSegment.empty()
-    total_lines = len(parsed_dialogue)
+    total_items = len(parsed_dialogue)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         last_speaker = None
+        turn_counter = 0
+
         for idx, item in enumerate(parsed_dialogue):
+            item_type = item.get("type", "dialogue")
+
+            # 1. Handle explicit exam Pause blocks
+            if item_type == "pause":
+                pause_ms = item["duration_ms"]
+                pause_sec = pause_ms / 1000.0
+                if status_text:
+                    status_text.text(f"Inserting Exam Silence: {item['label']} ({pause_sec:.1f}s)...")
+                
+                # Append explicit exam pause duration
+                combined_audio += AudioSegment.silent(duration=pause_ms)
+                last_speaker = None  # Reset speaker transition after long exam silence
+                if progress_bar:
+                    progress_bar.progress((idx + 1) / total_items)
+                continue
+
+            # 2. Handle dialogue turn
             speaker = item["speaker"]
             raw_text = item["text"]
-
-            # 1. Normalize text for speech prosody
             speech_text = normalize_ielts_speech_text(raw_text)
             voice_id = speaker_voice_map.get(speaker, "en-GB-RyanNeural")
 
-            # 2. Conversational rhythm jitter
-            # Humans speak short affirmations ("Of course", "Right, I will") slightly quicker,
-            # and longer explanations at a measured tempo.
+            # Conversational rhythm jitter
             word_count = len(speech_text.split())
             if enable_rhythm_jitter:
                 jitter = random.randint(-2, 2)
-                if word_count <= 4:
+                # Official narrator speaks at calm measured pace
+                if "narrator" in speaker.lower():
+                    turn_rate = base_rate_pct - 1
+                elif word_count <= 4:
                     turn_rate = base_rate_pct + 4 + jitter
                 else:
                     turn_rate = base_rate_pct + jitter
@@ -341,16 +444,17 @@ def synthesize_natural_dialogue(
             pitch_str = f"{base_pitch_hz:+d}Hz"
 
             if status_text:
-                status_text.text(f"Speaking [{speaker}]: \"{raw_text[:40]}...\" ({idx + 1}/{total_lines})")
+                status_text.text(f"Speaking [{speaker}]: \"{raw_text[:40]}...\" ({idx + 1}/{total_items})")
 
-            tmp_file = os.path.join(tmp_dir, f"turn_{idx}.mp3")
+            tmp_file = os.path.join(tmp_dir, f"turn_{turn_counter}.mp3")
+            turn_counter += 1
             asyncio.run(generate_single_turn_audio(speech_text, voice_id, rate_str, pitch_str, tmp_file))
 
             clip = AudioSegment.from_file(tmp_file, format="mp3")
 
-            # 3. Dynamic human-like turn-taking pauses
-            if len(combined_audio) > 0:
-                if last_speaker and last_speaker != speaker:
+            # Dynamic human-like turn-taking pauses
+            if len(combined_audio) > 0 and last_speaker is not None:
+                if last_speaker != speaker:
                     # Random human turn-taking gap between speakers
                     p_duration = random.randint(turn_pause_range[0], turn_pause_range[1])
                     combined_audio += AudioSegment.silent(duration=p_duration)
@@ -363,7 +467,7 @@ def synthesize_natural_dialogue(
             last_speaker = speaker
 
             if progress_bar:
-                progress_bar.progress((idx + 1) / total_lines)
+                progress_bar.progress((idx + 1) / total_items)
 
         output_buffer = io.BytesIO()
         combined_audio.export(output_buffer, format="mp3", bitrate="192k")
@@ -374,7 +478,7 @@ def synthesize_natural_dialogue(
 def main():
     st.markdown('<div class="main-header">🎙️ IELTS Natural Conversational TTS Studio</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-header">Human-like multi-speaker IELTS audio powered by Microsoft Azure Neural voices with organic turn-taking pauses, prosodic rhythm, and acoustic letter spelling.</div>',
+        '<div class="sub-header">Human-like multi-speaker IELTS audio powered by Microsoft Azure Neural voices with exam pauses ([Pause: 30 seconds]), multi-character matching, and natural prosody.</div>',
         unsafe_allow_html=True
     )
 
@@ -436,63 +540,67 @@ def main():
         )
 
         st.markdown("---")
-        st.markdown("**Conversational Speech Normalizer:**")
-        st.markdown("✅ Spelled letters (`J-A-M-I-E-S-O-N` $\\rightarrow$ natural acoustic recitation)")
-        st.markdown("✅ Conversational pauses on em-dashes and commas")
-        st.markdown("✅ Time phrases and numbers articulated naturally")
+        st.markdown("**Transcript Features Supported:**")
+        st.markdown("✅ `[Pause: 30 seconds]` (Exact exam pauses)")
+        st.markdown("✅ `[Narrator]: ...` (Exam instructions)")
+        st.markdown("✅ Multi-characters (`[Tutor]`, `[Ruth]`, `[Ed]`)")
+        st.markdown("✅ Spelled letters (`J-A-M-I-E-S-O-N`)")
 
     # 2. Input Script Section
     st.markdown("### 1. Script / Dialogue Input")
 
-    col_btn1, col_btn2, _ = st.columns([1.6, 1.6, 2.8])
+    col_btn1, col_btn2, _ = st.columns([1.8, 1.8, 2.4])
     with col_btn1:
-        if st.button("Load Multi-Speaker Dialogue (Agent & Amber)"):
+        if st.button("Load IELTS Part 3 (Narrator, Tutor, Ruth & Ed)"):
+            st.session_state["transcript_input"] = (
+                "[Narrator]: Part 3. You will hear two psychology students, Ruth and Ed, discussing their research on birth order and personality with their tutor.\n"
+                "[Narrator]: First, you have some time to look at questions 21 to 26.\n"
+                "[Pause: 30 seconds]\n\n"
+                "[Tutor]: Come in, Ruth and Ed. Let's talk through your psychology seminar presentation on birth order and personality development.\n"
+                "[Ed]: Thanks, Dr Collins. We've reviewed extensive literature, including Francis Galton's early work and modern psychological studies.\n"
+                "[Ruth]: Right. It's fascinating how strongly popular culture associates birth order with distinct personality traits. For example, first-born children are commonly expected to be natural leaders and highly conscientious.\n"
+                "[Tutor]: Yes, and what did you find regarding eldest siblings?\n"
+                "[Ed]: Well, empirical findings show eldest siblings often display high academic achievement, but popular stereotypes that they are rigid or introverted aren't consistently supported.\n"
+                "[Ruth]: And with middle children, public perception often describes them as peacemakers and exceptional negotiators, because they grew up mediating between older and younger siblings.\n"
+                "[Ed]: On the other hand, the youngest child in a family is frequently characterised as rebellious and willing to take risks, seeking distinction from older brothers and sisters.\n"
+                "[Ruth]: As for only children, they often suffer from the stereotype of being selfish or spoiled, but research indicates they are actually very self-confident and articulate because of extensive adult interaction.\n"
+                "[Ed]: And identical twins raised together showed strong mutual empathy and cooperative tendencies, though sometimes struggling to establish individual identity.\n\n"
+                "[Narrator]: Before you hear the rest of the discussion, you have some time to look at questions 27 to 30.\n"
+                "[Pause: 30 seconds]\n\n"
+                "[Tutor]: What about the methodology in earlier birth order studies? What flaws did you identify?\n"
+                "[Ruth]: A major methodological weakness was sample bias. Many early studies failed to control for family socioeconomic status and family size. A large family has very different dynamics than a two-child family.\n"
+                "[Ed]: Exactly. When modern researchers controlled for socioeconomic background, many supposed birth order effects vanished.\n"
+                "[Tutor]: And what are the two main conclusions for your presentation slides?\n"
+                "[Ruth]: First, we want to emphasize that parental expectations shape behaviour far more decisively than birth rank alone.\n"
+                "[Ed]: And second, that sibling spacing—the number of years between children—plays a far greater role than simple sequence.\n\n"
+                "[Narrator]: That is the end of Part 3. You now have half a minute to check your answers.\n"
+                "[Pause: 30 seconds]"
+            )
+    with col_btn2:
+        if st.button("Load IELTS Part 1 (Agent & Amber)"):
             st.session_state["transcript_input"] = (
                 "[Agent]: Good morning, Bankside Recruitment Agency. Can I help you?\n"
                 "[Amber]: Oh, hello. I'm calling to register with your agency for temporary work.\n"
                 "[Agent]: Certainly. May I take your name first?\n"
                 "[Amber]: Yes, it's Amber Jamieson.\n"
                 "[Agent]: Could you spell the surname for me, please?\n"
-                "[Amber]: That's J-A-M-I-E-S-O-N.\n"
-                "[Agent]: Thank you. And what kind of work are you primarily interested in, Amber?\n"
-                "[Amber]: Well, clerical or administrative roles, ideally. I'm available mornings and early afternoons, but an afternoon shift would suit me best.\n"
-                "[Agent]: Great, an afternoon placement is often easier to arrange. What would you say are your strongest professional skills?\n"
-                "[Amber]: I have extensive administrative experience, and my communication skills are very strong—both written and on the phone.\n"
-                "[Agent]: Excellent. We have a position opening next week for a receptionist at a legal firm. The assignment is scheduled to last for a week, with the possibility of extension.\n"
-                "[Agent]: The pay rate starts at 10 pounds an hour.\n"
-                "[Amber]: Ten pounds an hour sounds reasonable.\n"
-                "[Agent]: Now, before we can send you on assignments, you'll need to attend an interview at our office. Please make sure you wear a suit for the interview.\n"
-                "[Amber]: Of course.\n"
-                "[Agent]: And remember to bring your passport as proof of your right to work in the UK.\n"
-                "[Amber]: Right, I'll bring that along.\n"
-                "[Agent]: You'll also take a short test online before coming in—it's a personality assessment to help match you to company cultures.\n"
-                "[Amber]: Okay, no problem.\n"
-                "[Agent]: Afterwards, we always ask clients to provide feedback on our candidates so we can support your ongoing development.\n"
-                "[Amber]: That's very helpful. What time should I arrive on Tuesday?\n"
-                "[Agent]: Please be here right on time, at 9:30 AM.\n"
-                "[Amber]: Thank you very much!"
-            )
-    with col_btn2:
-        if st.button("Load Single-Speaker IELTS Talk (Section 4)"):
-            st.session_state["transcript_input"] = (
-                "Good morning everyone, and welcome to this lecture on sustainable urban architecture. "
-                "Today, I'd like to look at how modern city planners are incorporating green rooftop gardens "
-                "to reduce the urban heat island effect. In the first part of this talk, we'll examine the thermal properties "
-                "of sedum plants, and then move on to water drainage management in high-density buildings."
+                "[Amber]: That's J-A-M-I-E-S-O-N."
             )
 
     default_text = st.session_state.get(
         "transcript_input",
-        "[Agent]: Good morning, Bankside Recruitment Agency. Can I help you?\n"
-        "[Amber]: Oh, hello. I'm calling to register with your agency for temporary work.\n"
-        "[Agent]: Certainly. May I take your name first?\n"
-        "[Amber]: Yes, it's Amber Jamieson."
+        "[Narrator]: Part 3. You will hear two psychology students, Ruth and Ed, discussing their research on birth order and personality with their tutor.\n"
+        "[Narrator]: First, you have some time to look at questions 21 to 26.\n"
+        "[Pause: 30 seconds]\n\n"
+        "[Tutor]: Come in, Ruth and Ed. Let's talk through your psychology seminar presentation on birth order and personality development.\n"
+        "[Ed]: Thanks, Dr Collins. We've reviewed extensive literature, including Francis Galton's early work and modern psychological studies.\n"
+        "[Ruth]: Right. It's fascinating how strongly popular culture associates birth order with distinct personality traits."
     )
 
     transcript_text = st.text_area(
         label="Paste transcript, JSON string, or monologue:",
         value=default_text,
-        height=220,
+        height=240,
         placeholder="Paste your conversation or monologue text here..."
     )
 
@@ -501,19 +609,24 @@ def main():
         return
 
     # 3. Parse Transcript & Detect Mode
-    parsed_lines, is_monologue = parse_dialogue_or_monologue(transcript_text)
-    unique_speakers = sorted(list({item["speaker"] for item in parsed_lines}))
+    parsed_items, is_monologue = parse_dialogue_or_monologue(transcript_text)
+    
+    # Extract unique speakers (excluding pause items)
+    dialogue_items = [item for item in parsed_items if item.get("type") == "dialogue"]
+    pause_items = [item for item in parsed_items if item.get("type") == "pause"]
+    unique_speakers = sorted(list({item["speaker"] for item in dialogue_items}))
 
+    # Display status badge
     if is_monologue:
         st.markdown(
             '<span class="monologue-badge">🎙️ Single-Speaker Monologue Detected</span> '
-            '<span style="color:#64748B; font-size:0.9rem;">(Lecture / Part 2 / Part 4 style)</span>',
+            f'<span style="color:#64748B; font-size:0.9rem;">({len(dialogue_items)} dialogue units, {len(pause_items)} pauses)</span>',
             unsafe_allow_html=True
         )
     else:
         st.markdown(
             f'<span class="speaker-badge">👥 Multi-Character Dialogue Detected ({len(unique_speakers)} Speakers)</span> '
-            f'<span style="color:#64748B; font-size:0.9rem;">({len(parsed_lines)} conversational turns)</span>',
+            f'<span style="color:#64748B; font-size:0.9rem;">({len(dialogue_items)} spoken turns, {len(pause_items)} exam pauses)</span>',
             unsafe_allow_html=True
         )
 
@@ -529,7 +642,7 @@ def main():
         smart_defaults[speaker] = matched
         used_voices.append(matched)
 
-    cols = st.columns(max(1, min(len(unique_speakers), 3)))
+    cols = st.columns(max(1, min(len(unique_speakers), 4)))
     for idx, speaker in enumerate(unique_speakers):
         col = cols[idx % len(cols)]
         recommended_key = smart_defaults[speaker]
@@ -550,31 +663,38 @@ def main():
             )
             speaker_voice_map[speaker] = voice_options[selected_label]
 
-    with st.expander("🔍 View Script & Speech Normalization Preview", expanded=False):
-        for idx, item in enumerate(parsed_lines, 1):
-            normalized_line = normalize_ielts_speech_text(item['text'])
-            if is_monologue:
-                st.markdown(f"<div class='line-box'>{item['text']}</div>", unsafe_allow_html=True)
-            else:
-                assigned_v = speaker_voice_map.get(item['speaker'], '')
+    # Interactive Breakdown View
+    with st.expander("🔍 View Script, Pauses & Speech Preview", expanded=False):
+        for idx, item in enumerate(parsed_items, 1):
+            if item.get("type") == "pause":
                 st.markdown(
-                    f"<div class='line-box'><b>#{idx}</b> <span class='speaker-badge'>{item['speaker']}</span> "
+                    f"<div class='pause-box'><b>#{idx}</b> <span class='pause-badge'>⏸️ Exam Pause</span> "
+                    f"Silence gap: <b>{item['duration_ms'] / 1000.0} seconds</b> ({item['label']})</div>",
+                    unsafe_allow_html=True
+                )
+            else:
+                normalized_line = normalize_ielts_speech_text(item['text'])
+                assigned_v = speaker_voice_map.get(item['speaker'], '')
+                is_narrator = "narrator" in item['speaker'].lower()
+                badge_class = "narrator-badge" if is_narrator else "speaker-badge"
+                st.markdown(
+                    f"<div class='line-box'><b>#{idx}</b> <span class='{badge_class}'>{item['speaker']}</span> "
                     f"<small style='color:#6B7280;'>({assigned_v})</small><br/>"
-                    f"<b>Raw:</b> {item['text']}<br/>"
-                    f"<b>Acoustic Speech Input:</b> <i>{normalized_line}</i></div>",
+                    f"<b>Text:</b> {item['text']}<br/>"
+                    f"<b>Acoustic Input:</b> <i>{normalized_line}</i></div>",
                     unsafe_allow_html=True
                 )
 
     # 5. Audio Synthesis
     st.markdown("### 3. Generate Audio")
-    if st.button("🚀 Synthesize Natural Dialogue", type="primary", use_container_width=True):
+    if st.button("🚀 Synthesize Full IELTS Exam Audio", type="primary", use_container_width=True):
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
         try:
-            with st.spinner("Synthesizing dialogue lines with Microsoft Neural Engine & natural conversational timing..."):
+            with st.spinner("Synthesizing multi-character dialogue & assembling exam pauses with Microsoft Neural Engine..."):
                 audio_buffer = synthesize_natural_dialogue(
-                    parsed_dialogue=parsed_lines,
+                    parsed_dialogue=parsed_items,
                     speaker_voice_map=speaker_voice_map,
                     base_rate_pct=base_rate,
                     base_pitch_hz=base_pitch,
@@ -585,7 +705,7 @@ def main():
                 )
 
             progress_bar.progress(1.0)
-            status_text.success("Audio synthesized successfully with natural conversational flow!")
+            status_text.success("Audio synthesized successfully with full multi-speaker dialogue and exam pauses!")
             st.session_state["edge_generated_audio"] = audio_buffer.getvalue()
         except Exception as e:
             status_text.error(f"Error during audio generation: {e}")
@@ -596,9 +716,9 @@ def main():
         st.audio(st.session_state["edge_generated_audio"], format="audio/mp3")
 
         st.download_button(
-            label="📥 Download IELTS Dialogue (MP3)",
+            label="📥 Download Complete IELTS Audio (MP3)",
             data=st.session_state["edge_generated_audio"],
-            file_name="ielts_natural_dialogue.mp3",
+            file_name="ielts_part3_practice.mp3",
             mime="audio/mp3",
             type="primary"
         )
